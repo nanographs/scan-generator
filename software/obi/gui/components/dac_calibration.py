@@ -4,7 +4,9 @@ import numpy as np
 
 from PyQt6.QtWidgets import (QLabel, QGridLayout, QApplication, QWidget, QProgressBar, QTabWidget,
                              QSpinBox, QComboBox, QHBoxLayout, QVBoxLayout, QPushButton)
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QPixmap
+from PyQt6.QtCore import QSize
+
 import qasync
 from qasync import asyncSlot, asyncClose, QApplication, QEventLoop
 import pyqtgraph as pg
@@ -35,6 +37,8 @@ class DACSettings(QHBoxLayout):
         self.addWidget(self.mid_btn)
         self.addWidget(self.min_btn)
         self.addWidget(self.field)
+
+        self.midClicked() #set to mid value when on initialization
 
     def maxClicked(self):
         self.field.setValue(16383)
@@ -183,10 +187,12 @@ class DACTest(QVBoxLayout):
         self.addWidget(self.plot)
         self.addLayout(self.x_settings)
         self.addLayout(self.y_settings)
-        self.addLayout(self.adc_settings)
-        self.addWidget(self.start_btn)
+
+        h = QHBoxLayout()
+        h.addLayout(self.adc_settings)
+        h.addWidget(self.start_btn)
+        self.addLayout(h)
     
-        
     def getvals(self):
         x_coord = int(self.x_settings.field.cleanText())
         y_coord = int(self.y_settings.field.cleanText())
@@ -197,15 +203,18 @@ class DACTest(QVBoxLayout):
         x_coord, y_coord = self.getvals()
         print(f"{x_coord=}, {y_coord=}")
         cmd = VectorPixelCommand(x_coord = x_coord, y_coord = y_coord, dwell_time=100)
-        carray = bytearray()
-        for _ in range(16384):
-            carray.extend(bytes(cmd))
-        data = await self.conn.transfer(cmd)
+        # carray = bytearray()
+        # for _ in range(16384):
+        #     carray.extend(bytes(cmd))
+        return await self.conn.transfer(cmd)
         #await self.conn.transfer_bytes(carray)
+
+    def display_data(self, data):
         self.adc_settings.field.setText(f"{data[0]}")
         self.data[:self.pts-1] = self.data[1:self.pts]
         self.data[self.pts-1] = data[0]
         self.plot_data.setData(self.data)
+
     
     @asyncSlot()
     async def toggle_live(self):
@@ -213,11 +222,116 @@ class DACTest(QVBoxLayout):
         self.start_btn.to_live_state(stop.set)
         
         while not stop.is_set():
-            await self.setvals()
+            data = await self.setvals()
+            self.display_data(data)
         
         self.start_btn.to_paused_state(self.toggle_live)
         print("done")
 
+
+
+class RangeLineCtrl(QHBoxLayout):
+    pen_normal = pg.mkPen(color = "#ff4f00", width = 1)
+    pen_highlight = pg.mkPen(color = "#ee4b2b", width = 1)
+    def __init__(self, name:str, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.line = None
+        self.set_btn = QPushButton(f"Set {name}")
+        self.label = QLabel("")
+        self.addWidget(self.set_btn)
+        self.addWidget(self.label)
+    def setLine(self, value):
+        self.label.setText(f"{value}") 
+        self.line = pg.InfiniteLine(movable=False, angle=0, pen = self.pen_normal)
+        self.line.setPos([0,value])
+        return self.line
+    def highlightLine(self):
+        self.line.setPen(self.pen_highlight)
+    def getval(self):
+        return int(self.label.text())
+
+class PotTest(DACTest):
+    def __init__(self, conn):
+        super().__init__(conn)
+        images = QHBoxLayout()
+        adcimg = QLabel()
+        adcimg.setPixmap(QPixmap("/Users/isabelburgos/Open-Beam-Interface/software/docs/source/_static/ADC_adjustment.png").scaled(QSize(350,100)))
+        images.addWidget(adcimg)
+        dacimg = QLabel()
+        dacimg.setPixmap(QPixmap("/Users/isabelburgos/Open-Beam-Interface/software/docs/source/_static/DAC_adjustment.png").scaled(QSize(350,100)))
+        images.addWidget(dacimg)
+        self.addLayout(images)
+
+        h = QHBoxLayout()
+        self.maxrange = RangeLineCtrl("Max")
+        self.maxrange.setLine(16383)
+        h.addLayout(self.maxrange)
+        self.maxrange.set_btn.clicked.connect(self.setMax)
+        self.minrange = RangeLineCtrl("Min")
+        self.minrange.setLine(0)
+        h.addLayout(self.minrange)
+        self.minrange.set_btn.clicked.connect(self.setMin)
+        self.addLayout(h)
+
+        self.start_range_btn = QPushButton("Start Test")
+        self.exp_btn = QPushButton("copy to clipboard 📋")
+        self.start_range_btn.clicked.connect(self.doTest)
+        self.exp_btn.clicked.connect(self.exp)
+        hh = QHBoxLayout()
+        hh.addWidget(self.start_range_btn)
+        hh.addWidget(self.exp_btn)
+        self.addLayout(hh)
+        
+    def setLine(self, rangectrl:RangeLineCtrl):
+        try:
+            value = int(self.adc_settings.field.text())
+            line = rangectrl.setLine(value)
+            self.plot.addItem(line)
+        except: 
+            print("invalid value")
+
+    def setMax(self):
+        self.setLine(self.maxrange)
+    def setMin(self):
+        self.setLine(self.minrange)
+    
+    @asyncSlot()
+    async def toggle_live(self):
+        self.start_range_btn.setEnabled(False)
+        await super().toggle_live()
+        self.start_range_btn.setEnabled(True)
+
+    @asyncSlot()
+    async def doTest(self):
+        self.start_btn.setEnabled(False)
+        self.start_range_btn.setEnabled(False)
+        maxrange = self.maxrange.getval()
+        minrange = self.minrange.getval()
+        if not maxrange > minrange:
+            print(f"Max {maxrange} is not greater than Min {minrange}")
+            return
+        n = 0
+        wentOutOfRange = True
+        while n <= 4:
+            self.start_range_btn.setText(f"In progress.... {n}")
+            data = await self.setvals()
+            datapoint = data[0]
+            if minrange < datapoint < maxrange:
+                wentOutOfRange = False
+                self.display_data(data)
+            else:
+                if not wentOutOfRange:
+                    n += 1
+                    wentOutOfRange = True
+
+        self.start_range_btn.setEnabled(True)
+        self.start_range_btn.setText("Start Test")
+        self.start_btn.setEnabled(True)
+    
+    def exp(self):
+        exporter = pg.exporters.ImageExporter(self.plot.plotItem)
+        exporter.export("pots.png", copy=True)
+    
 
 
 class XYDACSettings(QVBoxLayout):
@@ -228,13 +342,17 @@ class XYDACSettings(QVBoxLayout):
 
         self.tabs = QTabWidget()
         dac_tab = QWidget()
+        pot_tab = QWidget()
         adc_tab = QWidget()
         self.tabs.addTab(dac_tab, "DAC")
+        self.tabs.addTab(pot_tab, "POT")
         self.tabs.addTab(adc_tab, "ADC")
         dac = DACTest(self.conn)
         adc = ADCTest(self.conn)
+        pot = PotTest(self.conn)
         dac_tab.setLayout(dac)
         adc_tab.setLayout(adc)
+        pot_tab.setLayout(pot)
         self.addWidget(self.tabs)
     
 
