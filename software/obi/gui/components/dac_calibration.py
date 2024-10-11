@@ -291,8 +291,10 @@ class PotTest(DACTest):
             print("invalid value")
 
     def setMax(self):
+        self.plot.removeItem(self.maxrange.line)
         self.setLine(self.maxrange)
     def setMin(self):
+        self.plot.removeItem(self.minrange.line)
         self.setLine(self.minrange)
     
     @asyncSlot()
@@ -311,18 +313,30 @@ class PotTest(DACTest):
             print(f"Max {maxrange} is not greater than Min {minrange}")
             return
         n = 0
-        wentOutOfRange = True
+        wentOutOfRangeLow = False
+        wentOutOfRangeHigh = False
         while n <= 4:
             self.start_range_btn.setText(f"In progress.... {n}")
             data = await self.setvals()
             datapoint = data[0]
             if minrange < datapoint < maxrange:
-                wentOutOfRange = False
                 self.display_data(data)
             else:
-                if not wentOutOfRange:
-                    n += 1
-                    wentOutOfRange = True
+                if minrange >= datapoint:
+                    self.minrange.line.setPen(self.minrange.pen_highlight)
+                    if not wentOutOfRangeLow:
+                        self.display_data(data)
+                        n += 1
+                        wentOutOfRangeLow = True
+                        wentOutOfRangeHigh = False
+                if maxrange <= datapoint:
+                    self.maxrange.line.setPen(self.maxrange.pen_highlight)
+                    if not wentOutOfRangeHigh:
+                        self.display_data(data)
+                        n += 1
+                        wentOutOfRangeHigh = True
+                        wentOutOfRangeLow = False
+
 
         self.start_range_btn.setEnabled(True)
         self.start_range_btn.setText("Start Test")
