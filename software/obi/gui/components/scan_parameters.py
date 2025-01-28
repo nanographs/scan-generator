@@ -79,7 +79,7 @@ class ScanParameters(QVBoxLayout):
         self.addLayout(self.dwell_time)
     def getval(self) -> int:
         resolution = self.resolution_settings.getval()
-        dwell = self.dwell_time.getval()
+        dwell = self.dwell_time.getval() - 1
         return resolution, dwell
 
 class LiveScanControls(ScanParameters):
