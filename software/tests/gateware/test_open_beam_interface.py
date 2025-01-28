@@ -13,8 +13,9 @@ logger = logging.getLogger()
 from obi.applet.open_beam_interface import StreamSignature
 from obi.applet.open_beam_interface import Supersampler, RasterScanner, RasterRegion
 from obi.applet.open_beam_interface import CommandParser, CommandExecutor, Command, BeamType, OutputMode, CmdType
-from obi.applet.open_beam_interface import BusController, Flippenator
+from obi.applet.open_beam_interface import BusController
 from obi.commands import *
+from obi.commands.structs import Transforms
 
 
 ## support functions for prettier output
@@ -133,15 +134,81 @@ class OBIAppletTestCase(unittest.TestCase):
             sim.run()
 
     ## Bus Controller
-    def test_bus_controller(self):
-        dut = BusController(adc_half_period=3, adc_latency=6)
-        async def put_testbench(ctx):
-            await put_stream(ctx, dut.dac_stream, {"dac_x_code": 123, "dac_y_code": 456, "last": 1})
+    def test_bus_controller_streams(self):
+        def test_one_cycle():
+            dut = BusController(adc_half_period=3, adc_latency=6)
+            async def put_testbench(ctx):
+                await put_stream(ctx, dut.dac_stream, {"dac_x_code": 123, "dac_y_code": 456, "last": 1})
 
-        async def get_testbench(ctx):
-            await get_stream(ctx, dut.adc_stream, {"adc_code": 0, "last": 1}, timeout_steps=100)
+            async def get_testbench(ctx):
+                await get_stream(ctx, dut.adc_stream, {"adc_code": 0, "last": 1}, timeout_steps=100)
 
-        self.simulate(dut, [put_testbench, get_testbench], name="bus_controller")
+            self.simulate(dut, [put_testbench, get_testbench], name="bus_controller_1")
+        
+        def test_multi_cycle():
+            dut = BusController(adc_half_period=3, adc_latency=6)
+            async def put_testbench(ctx):
+                await put_stream(ctx, dut.dac_stream, {"dac_x_code": 1, "dac_y_code": 1, "last": 0})
+                await ctx.tick().repeat(1)
+                await put_stream(ctx, dut.dac_stream, {"dac_x_code": 1, "dac_y_code": 1, "last": 0})
+                await ctx.tick().repeat(1)
+                await put_stream(ctx, dut.dac_stream, {"dac_x_code": 1, "dac_y_code": 1, "last": 0})
+                await ctx.tick().repeat(1)
+                await put_stream(ctx, dut.dac_stream, {"dac_x_code": 1, "dac_y_code": 1, "last": 1})
+                await ctx.tick().repeat(1)
+                await put_stream(ctx, dut.dac_stream, {"dac_x_code": 2, "dac_y_code": 2, "last": 0})
+                
+            async def get_testbench(ctx):
+                await get_stream(ctx, dut.adc_stream, {"adc_code": 0, "last": 0}, timeout_steps=100)
+                await get_stream(ctx, dut.adc_stream, {"adc_code": 0, "last": 0}, timeout_steps=100)
+                await get_stream(ctx, dut.adc_stream, {"adc_code": 0, "last": 0}, timeout_steps=100)
+                await get_stream(ctx, dut.adc_stream, {"adc_code": 0, "last": 1}, timeout_steps=100)
+
+            self.simulate(dut, [put_testbench, get_testbench], name="bus_controller_4")
+        
+        test_one_cycle()
+        test_multi_cycle()
+        
+    def test_bus_controller_transforms(self):
+        def test_xflip(xin: int, xout: int):
+            dut = BusController(adc_half_period=3, adc_latency=6, transforms = Transforms(xflip=True, yflip=False, rotate90=False))
+            async def put_testbench(ctx):
+                await put_stream(ctx, dut.dac_stream, {"dac_x_code": xin, "dac_y_code": 0, "last": 0})
+                trans_x, trans_y = ctx.get(dut.dac_x_code_transformed), ctx.get(dut.dac_y_code_transformed)
+                assert trans_x == xout, f"flipped x {trans_x} != expected {xout}"
+                assert trans_y == 0, f"non-flipped y {trans_y} != expected 0"
+                
+            self.simulate(dut, [put_testbench], name="xflip_{xin}_{xout}")
+        
+        def test_yflip(yin: int, yout: int):
+            dut = BusController(adc_half_period=3, adc_latency=6, transforms = Transforms(xflip=False, yflip=True, rotate90=False))
+            async def put_testbench(ctx):
+                await put_stream(ctx, dut.dac_stream, {"dac_x_code": 0, "dac_y_code": yin, "last": 0})
+                trans_x, trans_y = ctx.get(dut.dac_x_code_transformed), ctx.get(dut.dac_y_code_transformed)
+                assert trans_x == 0, f"non-flipped x {trans_x} != expected 0"
+                assert trans_y == yout, f"flipped y {trans_y} != expected {yout}"
+                
+            self.simulate(dut, [put_testbench], name="xflip_{xin}_{xout}")
+        
+        def test_rotate90():
+            dut = BusController(adc_half_period=3, adc_latency=6, transforms = Transforms(xflip=False, yflip=False, rotate90=True))
+            async def put_testbench(ctx):
+                await put_stream(ctx, dut.dac_stream, {"dac_x_code": 123, "dac_y_code": 456, "last": 0})
+                trans_x, trans_y = ctx.get(dut.dac_x_code_transformed), ctx.get(dut.dac_y_code_transformed)
+                assert trans_x == 456, f"rotated x {trans_x} != expected 456"
+                assert trans_y == 123, f"rotated y {trans_y} != expected 123"
+                
+            self.simulate(dut, [put_testbench], name="xflip_{xin}_{xout}")
+        
+        test_xflip(0, 16383)
+        test_xflip(16383, 0)
+        test_xflip(1, 16382)
+        test_xflip(16382, 1)
+        test_yflip(0, 16383)
+        test_yflip(16383, 0)
+        test_yflip(1, 16382)
+        test_yflip(16382, 1)
+        test_rotate90()
     
     ## Supersampler
     def test_supersampler_expand(self):
@@ -197,92 +264,7 @@ class OBIAppletTestCase(unittest.TestCase):
 
         self.simulate(dut, [put_testbench, get_testbench], name = "ss_avg2")
     
-    ## Flippenator
-    def test_flippenator(self):
-        # TODO: figure out why 16383 flips to 1 and not 0
-        dut = Flippenator()
-
-        def test_xflip(xin:int, xout:int):
-            async def put_testbench(ctx):
-                ctx.set(dut.transforms.xflip, 1)
-                await put_stream(ctx, dut.in_stream, {
-                    "dac_x_code": xin,
-                    "dac_y_code": 16383,
-                    "last": 1,
-                    "blank": {
-                        "enable": 1,
-                        "request": 1
-                    }
-                })
-            async def get_testbench(ctx):
-                await get_stream(ctx, dut.out_stream, {
-                    "dac_x_code": xout,
-                    "dac_y_code": 16383,
-                    "last": 1,
-                    "blank": {
-                        "enable": 1,
-                        "request": 1
-                    }
-                })
-            self.simulate(dut, [get_testbench,put_testbench], name=f"flippenator_xflip_in_{str(xin)}_out_{str(xout)}")  
-
-        def test_yflip(yin:int, yout:int):
-            async def put_testbench(ctx):
-                ctx.set(dut.transforms.yflip, 1)
-                await put_stream(ctx, dut.in_stream, {
-                    "dac_x_code": 1,
-                    "dac_y_code": yin,
-                    "last": 1,
-                    "blank": {
-                        "enable": 1,
-                        "request": 1
-                    }
-                })
-            async def get_testbench(ctx):
-                await get_stream(ctx, dut.out_stream, {
-                    "dac_x_code": 1,
-                    "dac_y_code": yout,
-                    "last": 1,
-                    "blank": {
-                        "enable": 1,
-                        "request": 1
-                    }
-                })
-            self.simulate(dut, [get_testbench,put_testbench], name=f"flippenator_yflip_in_{str(yin)}_out_{str(yout)}")  
-
-        def test_rot90():
-            async def put_testbench(ctx):
-                ctx.set(dut.transforms.rotate90, 1)
-                await put_stream(ctx, dut.in_stream, {
-                    "dac_x_code": 1,
-                    "dac_y_code": 16383,
-                    "last": 1,
-                    "blank": {
-                        "enable": 1,
-                        "request": 1
-                    }
-                })
-            async def get_testbench(ctx):
-                await get_stream(ctx, dut.out_stream, {
-                    "dac_x_code": 16383,
-                    "dac_y_code": 1,
-                    "last": 1,
-                    "blank": {
-                        "enable": 1,
-                        "request": 1
-                    }
-                })
-            self.simulate(dut, [get_testbench,put_testbench], name="flippenator_rot90")  
-        test_xflip(16383, 0)
-        test_xflip(0, 16383)
-        test_xflip(16382, 1)
-        test_xflip(1, 16382)
-        test_yflip(16383, 0)
-        test_yflip(0, 16383)
-        test_yflip(16382, 1)
-        test_yflip(1, 16382)
-        test_rot90()
-
+    
     # Raster Scanner
     def test_raster_scanner(self):
 
@@ -537,7 +519,7 @@ class OBIAppletTestCase(unittest.TestCase):
             ctx.set(dut.cmd_stream.valid, 1)
             await ctx.tick().until(dut.cmd_stream.ready == 0)
             ctx.set(dut.cmd_stream.valid, 0)
-            await ctx.tick().until(dut.flippenator.out_stream.valid == 1) # bus controller recieves dac codes
+            await ctx.tick().until(dut.supersampler.super_dac_stream.valid == 1) # bus controller recieves dac codes
             await ctx.tick("dac_clk").repeat(2) # dac codes are latched
             assert ctx.get(dut.blank_enable) == 0
 
@@ -550,7 +532,7 @@ class OBIAppletTestCase(unittest.TestCase):
             ctx.set(dut.cmd_stream.valid, 1)
             await ctx.tick().until(dut.cmd_stream.ready == 0)
             ctx.set(dut.cmd_stream.valid, 0)
-            await ctx.tick().until(dut.flippenator.out_stream.valid == 1) # bus controller recieves dac codes
+            await ctx.tick().until(dut.supersampler.super_dac_stream.valid == 1) # bus controller recieves dac codes
             await ctx.tick("dac_clk").repeat(2) # dac codes are latched
             assert ctx.get(dut.blank_enable) == 1
         

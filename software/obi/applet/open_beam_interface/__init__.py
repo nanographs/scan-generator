@@ -16,7 +16,7 @@ from glasgow.device import GlasgowDeviceError
 
 from usb1 import USBError
 
-from obi.commands.structs import CmdType, BeamType, OutputMode
+from obi.commands.structs import CmdType, BeamType, OutputMode, Transforms
 from obi.commands.low_level_commands import Command, ExternalCtrlCommand
 
 import logging
@@ -138,31 +138,6 @@ class SuperDACStream(data.Struct):
     delay: 3
 
 
-class Transforms(data.Struct):
-    xflip: 1
-    yflip: 1
-    rotate90: 1
-
-class Flippenator(wiring.Component):
-    transforms: In(Transforms)
-    in_stream: In(StreamSignature(SuperDACStream))
-    out_stream: Out(StreamSignature(SuperDACStream))
-    def elaborate(self, platform):
-        m = Module()
-        a = Signal(14)
-        b = Signal(14)
-        with m.If(~self.out_stream.valid | (self.out_stream.valid & self.out_stream.ready)):
-            m.d.comb += a.eq(Mux(self.transforms.rotate90, self.in_stream.payload.dac_y_code, self.in_stream.payload.dac_x_code))
-            m.d.comb += b.eq(Mux(self.transforms.rotate90, self.in_stream.payload.dac_x_code, self.in_stream.payload.dac_y_code))
-            m.d.sync += self.out_stream.payload.dac_x_code.eq(Mux(self.transforms.xflip, 16383-a, a)) #>> xscale)
-            m.d.sync += self.out_stream.payload.dac_y_code.eq(Mux(self.transforms.yflip, 16383-b, b)) #>> yscale)
-            m.d.sync += self.out_stream.payload.last.eq(self.in_stream.payload.last)
-            m.d.sync += self.out_stream.payload.blank.eq(self.in_stream.payload.blank)
-            m.d.sync += self.out_stream.valid.eq(self.in_stream.valid)
-        m.d.comb += self.in_stream.ready.eq(self.out_stream.ready)
-        return m
-        
-
 
 class BusController(wiring.Component):
     # FPGA-side interface
@@ -178,12 +153,16 @@ class BusController(wiring.Component):
     bus: Out(BusSignature)
     inline_blank: Out(BlankRequest)
 
-    def __init__(self, *, adc_half_period: int, adc_latency: int):
+    def __init__(self, *, adc_half_period: int, adc_latency: int, transforms: Transforms = Transforms(False,False,False)):
         assert (adc_half_period * 2) >= 6, "ADC period must be large enough for FSM latency"
         self.adc_half_period = adc_half_period
         self.adc_latency     = adc_latency
+        self.transforms = transforms
 
         super().__init__()
+
+        self.dac_x_code_transformed = Signal.like(self.dac_stream.payload.dac_x_code)
+        self.dac_y_code_transformed = Signal.like(self.dac_stream.payload.dac_y_code)
 
     def elaborate(self, platform):
         m = Module()
@@ -217,6 +196,9 @@ class BusController(wiring.Component):
         ]
 
         dac_stream_data = Signal.like(self.dac_stream.payload)
+        
+        x = Signal.like(self.dac_x_code_transformed)
+        y = Signal.like(self.dac_y_code_transformed)
 
         m.d.comb += adc_stream_data.adc_code.eq(self.bus.data_i)
 
@@ -238,6 +220,25 @@ class BusController(wiring.Component):
                     # Latch DAC codes from input stream.
                     m.d.comb += self.dac_stream.ready.eq(1)
                     m.d.sync += dac_stream_data.eq(self.dac_stream.payload)
+                    # Transforms
+                    # Rotate first so that x is x and y is y, then flip x and y as needed
+                    if self.transforms.rotate90:
+                        m.d.comb += x.eq(self.dac_stream.payload.dac_y_code)
+                        m.d.comb += y.eq(self.dac_stream.payload.dac_x_code)
+                    else:
+                        m.d.comb += x.eq(self.dac_stream.payload.dac_x_code)
+                        m.d.comb += y.eq(self.dac_stream.payload.dac_y_code)
+                    
+                    if self.transforms.xflip:
+                        m.d.sync += self.dac_x_code_transformed.eq(16383-x)
+                    else:
+                        m.d.sync += self.dac_x_code_transformed.eq(x)
+
+                    if self.transforms.yflip:
+                        m.d.sync += self.dac_y_code_transformed.eq(16383-y)
+                    else:
+                        m.d.sync += self.dac_y_code_transformed.eq(y)
+
                     # Transmit blanking state from input stream
                     m.d.comb += self.inline_blank.eq(self.dac_stream.payload.blank)
                     # Schedule ADC sample for these DAC codes to be output.
@@ -254,14 +255,14 @@ class BusController(wiring.Component):
 
             with m.State("X_DAC_Write"):
                 m.d.comb += [
-                    self.bus.data_o.eq(dac_stream_data.dac_x_code),
+                    self.bus.data_o.eq(self.dac_x_code_transformed),
                     self.bus.data_oe.eq(1),
                 ]
                 m.next = "X_DAC_Write_2"
 
             with m.State("X_DAC_Write_2"):
                 m.d.comb += [
-                    self.bus.data_o.eq(dac_stream_data.dac_x_code),
+                    self.bus.data_o.eq(self.dac_x_code_transformed),
                     self.bus.data_oe.eq(1),
                     self.bus.dac_x_le_clk.eq(1),
                 ]
@@ -269,14 +270,14 @@ class BusController(wiring.Component):
 
             with m.State("Y_DAC_Write"):
                 m.d.comb += [
-                    self.bus.data_o.eq(dac_stream_data.dac_y_code),
+                    self.bus.data_o.eq(self.dac_y_code_transformed),
                     self.bus.data_oe.eq(1),
                 ]
                 m.next = "Y_DAC_Write_2"
 
             with m.State("Y_DAC_Write_2"):
                 m.d.comb += [
-                    self.bus.data_o.eq(dac_stream_data.dac_y_code),
+                    self.bus.data_o.eq(self.dac_y_code_transformed),
                     self.bus.data_oe.eq(1),
                     self.bus.dac_y_le_clk.eq(1),
                 ]
@@ -641,7 +642,6 @@ class CommandExecutor(wiring.Component):
     #: Active if `Synchronize`, `Flush`, or `Abort` was the last received command.
     flush: Out(1)
 
-    default_transforms: In(Transforms)
     # Input to Scan/Signal Selector Relay Board
     ext_ctrl_enable: Out(2)
     ext_ctrl_enabled: Out(2)
@@ -653,13 +653,14 @@ class CommandExecutor(wiring.Component):
     output_mode: Out(2)
 
 
-    def __init__(self, *, out_only:bool=False, adc_latency=8, ext_switch_delay=960000):
+    def __init__(self, *, out_only:bool=False, adc_latency=8, ext_switch_delay=960000,
+                transforms: Transforms=Transforms(False, False, False)):
         self.adc_latency = adc_latency
         # Time for external control relay/switch to actuate
         self.ext_switch_delay = ext_switch_delay
+        self.transforms = transforms
 
         self.supersampler = Supersampler()
-        self.flippenator = Flippenator()
 
         self.out_only = out_only
         super().__init__()
@@ -675,23 +676,16 @@ class CommandExecutor(wiring.Component):
         if self.out_only:
             m.submodules.bus_controller = bus_controller = FastBusController()
         else:
-            m.submodules.bus_controller = bus_controller = BusController(adc_half_period=3, adc_latency=self.adc_latency)
-        m.submodules.supersampler   = self.supersampler
-        m.submodules.flippenator    = self.flippenator
+            m.submodules.bus_controller = bus_controller = BusController(adc_half_period=3, adc_latency=self.adc_latency, transforms=self.transforms)
         m.submodules.raster_scanner = self.raster_scanner = RasterScanner()
+        m.submodules.supersampler = self.supersampler
 
-        wiring.connect(m, self.supersampler.super_dac_stream, self.flippenator.in_stream)
-        wiring.connect(m, self.flippenator.out_stream, bus_controller.dac_stream)
+        wiring.connect(m, self.supersampler.super_dac_stream, bus_controller.dac_stream)
         wiring.connect(m, bus_controller.adc_stream, self.supersampler.super_adc_stream)
         wiring.connect(m, flipped(self.bus), bus_controller.bus)
         m.d.comb += self.inline_blank.eq(bus_controller.inline_blank)
 
         vector_stream = StreamSignature(DACStream).create()
-
-        command_transforms = Signal(Transforms)
-        m.d.comb += self.flippenator.transforms.xflip.eq(command_transforms.xflip ^ self.default_transforms.xflip)
-        m.d.comb += self.flippenator.transforms.yflip.eq(command_transforms.yflip ^ self.default_transforms.yflip)
-        m.d.comb += self.flippenator.transforms.rotate90.eq(command_transforms.rotate90 ^ self.default_transforms.rotate90)
 
         raster_mode = Signal()
         output_mode = Signal(2)
@@ -984,7 +978,7 @@ obi_resources  = [
 
 class OBISubtarget(wiring.Component):
     def __init__(self, *, ports, out_fifo, in_fifo, #led, control, data, 
-                        ext_switch_delay=0, xflip = False, yflip = False, rotate90 = False, 
+                        ext_switch_delay=0, transforms: Transforms, 
                         benchmark_counters=None, loopback=False, out_only=False):
         self.ports            = ports
         self.out_fifo         = out_fifo
@@ -994,10 +988,7 @@ class OBISubtarget(wiring.Component):
         # self.data             = data
 
         self.ext_switch_delay = ext_switch_delay
-        self.xflip            = xflip
-        self.yflip            = yflip
-        self.rotate90         = rotate90
-
+        self.transforms = transforms
         self.loopback         = loopback
         self.out_only         = out_only
 
@@ -1015,7 +1006,7 @@ class OBISubtarget(wiring.Component):
 
         ## core modules and interconnections
         m.submodules.parser     = parser     = CommandParser()
-        m.submodules.executor   = executor   = CommandExecutor(out_only=self.out_only, ext_switch_delay=self.ext_switch_delay)
+        m.submodules.executor   = executor   = CommandExecutor(out_only=self.out_only, ext_switch_delay=self.ext_switch_delay, transforms=self.transforms)
         m.submodules.serializer = serializer = ImageSerializer()
 
         wiring.connect(m, parser.cmd_stream, executor.cmd_stream)
@@ -1033,14 +1024,6 @@ class OBISubtarget(wiring.Component):
             self.in_fifo.flush.eq(executor.flush),
             serializer.output_mode.eq(executor.output_mode)
         ]
-
-        ### Configure with default transforms
-        if self.xflip:
-            m.d.comb += executor.default_transforms.xflip.eq(1)
-        if self.yflip:
-            m.d.comb += executor.default_transforms.yflip.eq(1)
-        if self.rotate90:
-            m.d.comb += executor.default_transforms.rotate90.eq(1)
 
 
         ## Ports/resources ==========================================================
@@ -1233,9 +1216,7 @@ class OBIApplet(GlasgowApplet):
             "in_fifo": iface.get_in_fifo(depth=512, auto_flush=False),
             "out_fifo": iface.get_out_fifo(depth=512),
             "loopback": args.loopback,
-            "xflip": args.xflip,
-            "yflip": args.yflip,
-            "rotate90": args.rotate90,
+            "transforms": Transforms(args.xflip, args.yflip, args.rotate90),
             "out_only": args.out_only
         }
 

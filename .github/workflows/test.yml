@@ -2,8 +2,13 @@ name: Run Unit Tests
 on: 
     push:
         paths:
-        - 'software/*'
-        - '.github/workflows/test.yml' # Trigger on changes to the workflow file
+          - 'software/*'
+          - '.github/workflows/test.yml' # Trigger on changes to the workflow file
+    pull_request:
+        paths:
+          - 'software/*'
+          - '.github/workflows/test.yml' # Trigger on changes to the workflow file
+
 
 defaults:
   run:
